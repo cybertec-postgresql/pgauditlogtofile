@@ -29,6 +29,8 @@
 #include <storage/pg_shmem.h>
 #include <storage/proc.h>
 #include <tcop/tcopprot.h>
+#include <utils/guc.h>
+#include <utils/json.h>
 #include <utils/ps_status.h>
 
 #include <pthread.h>
@@ -51,6 +53,21 @@
 #define LBF_MODE _IOLBF
 #endif
 
+/* deparsed audit record */
+struct audit_record
+{
+	char *type;	/* OBJECT or SESSION */
+	char *statement_id;
+	char *substatement_id;
+	char *class;
+	char *command_tag;
+	char *object_type;
+	char *object_name;
+	char *statement;
+	char *parameters;
+	char *rows;
+};
+
 /* variables to use only in this unit */
 static char formatted_log_time[FORMATTED_TS_LEN];
 static char formatted_start_time[FORMATTED_TS_LEN];
@@ -59,6 +76,10 @@ static int autoclose_thread_status_debug = 0; // 0: new proc, 1: th running, 2: 
 
 /* forward declaration private functions */
 void pgauditlogtofile_close_file(void);
+char *pgauditlogtofile_unquote(char *s, char **dest);
+void pgauditlogtofile_parse_csv(struct audit_record*, char *);
+void pgauditlogtofile_append_csv(StringInfo buf, char * const key, const char *val, bool escape_val, bool first, bool last);
+void pgauditlogtofile_append_json(StringInfo buf, char * const key, const char *val, bool escape_val, bool first, bool last);
 void pgauditlogtofile_create_audit_line(StringInfo buf, const ErrorData *edata, int exclude_nchars);
 void pgauditlogtofile_format_log_time(void);
 void pgauditlogtofile_format_start_time(void);
@@ -316,6 +337,160 @@ bool pgauditlogtofile_write_audit(const ErrorData *edata, int exclude_nchars)
 }
 
 /**
+ * @brief removes quotes from a possibly quoted CSV entry
+ * @param s: the input string (will be overwritten)
+ * @param dest: address of the result string
+ * @return char* - the position at the end of the parsed string
+ */
+char *pgauditlogtofile_unquote(char *s, char **dest)
+{
+	char *p = s;
+	bool quoted = false, done = false;
+
+	*dest = s;
+
+	while (!done)
+		switch (*s)
+		{
+			case '"':
+				s++;
+
+				if (!quoted)
+				{
+					quoted = true;
+					break;
+				}
+
+				if (*s == '"')
+					*p++ = *s++;
+				else
+					quoted = false;
+
+				break;
+			case '\0':
+				done = true;
+
+				break;
+			case ',':
+				if (!quoted)
+				{
+					*p = '\0';
+					done = true;
+					break;
+				}
+				/* fallthrough */
+			default:
+				*p++ = *s++;
+		}
+
+	return s;
+}
+
+/**
+ * @brief parses a CSV audit log entry into its components
+ * @param target: the record to fill
+ * @param csv: the CSV log line (will be overwritten)
+ */
+void pgauditlogtofile_parse_csv(struct audit_record* target, char *csv)
+{
+	/* type */
+	target->type = csv;
+	for (; *csv != ','; ++csv)
+		;
+	*csv = '\0';
+
+	/* statement_id */
+	target->statement_id = ++csv;
+	for (; *csv != ','; ++csv)
+		;
+	*csv = '\0';
+
+	/* substatement_id */
+	target->substatement_id = ++csv;
+	for (; *csv != ','; ++csv)
+		;
+	*csv = '\0';
+
+	/* class */
+	target->class = ++csv;
+	for (; *csv != ','; ++csv)
+		;
+	*csv = '\0';
+
+	/* command_tag */
+	target->command_tag = ++csv;
+	for (; *csv != ','; ++csv)
+		;
+	*csv = '\0';
+
+	/* object_type */
+	target->object_type = ++csv;
+	for (; *csv != ','; ++csv)
+		;
+	*csv = '\0';
+
+	/* object_name */
+	csv = pgauditlogtofile_unquote(++csv, &(target->object_name));
+
+	/* statement */
+	csv = pgauditlogtofile_unquote(++csv, &(target->statement));
+
+	/* parameters */
+	csv = pgauditlogtofile_unquote(++csv, &(target->parameters));
+
+	target->rows = NULL;
+	if (*(++csv) != '\0')
+		target->rows = csv;
+}
+
+/**
+ * @brief Appends a value to a CSV log line
+ * @param buf: buffer to write the formatted line
+ * @param key: name of the column to add (ignored)
+ * @param val: a string value
+ * @param escape_val: should the value be escaped? (ignored)
+ * @param first: is this the first column? (ignored)
+ * @param last: is this the last column?
+ */
+void pgauditlogtofile_append_csv(StringInfo buf, char * const key, const char *val, bool escape_val, bool first, bool last)
+{
+	appendStringInfoString(buf, val);
+	if (last)
+		appendStringInfoChar(buf, '\n');
+	else
+		appendStringInfoChar(buf, ',');
+}
+
+/**
+ * @brief Appends a value to a JSON log line
+ * @param buf: buffer to write the formatted line
+ * @param key: name of the column to add
+ * @param val: a string value
+ * @param escape_val: should the value be escaped?
+ * @param first: is this the first column?
+ * @param last: is this the last column?
+ */
+void pgauditlogtofile_append_json(StringInfo buf, char * const key, const char *val, bool escape_val, bool first, bool last)
+{
+	/* don't write empty values */
+	if (val == NULL || val[0] == '\0')
+		return;
+
+	if (first)
+		appendStringInfoChar(buf, '{');
+	escape_json(buf, key);
+	appendStringInfoChar(buf, ':');
+	if (escape_val)
+		escape_json(buf, val);
+	else
+		appendStringInfoString(buf, val);
+	if (last)
+		appendStringInfoString(buf, "}\n");
+    else
+		appendStringInfoChar(buf, ',');
+}
+
+/**
  * @brief Formats an audit log line
  * @param buf: buffer to write the formatted line
  * @param edata: error data
@@ -324,13 +499,18 @@ bool pgauditlogtofile_write_audit(const ErrorData *edata, int exclude_nchars)
  */
 void pgauditlogtofile_create_audit_line(StringInfo buf, const ErrorData *edata, int exclude_nchars)
 {
-  bool print_stmt = false;
-
   /* static counter for line numbers */
   static long log_line_number = 0;
 
   /* has counter been reset in current process? */
   static int log_my_pid = 0;
+
+  /* log function */
+  void (*write_to_log)(StringInfo, char * const, const char *, bool, bool, bool) =
+    guc_pgaudit_ltf_log_json ? &pgauditlogtofile_append_json : pgauditlogtofile_append_csv;
+
+  /* for composing log entries */
+  StringInfoData data;
 
   /*
    * This is one of the few places where we'd rather not inherit a static
@@ -349,146 +529,171 @@ void pgauditlogtofile_create_audit_line(StringInfo buf, const ErrorData *edata, 
 
   /* timestamp with milliseconds */
   pgauditlogtofile_format_log_time();
-  appendStringInfoString(buf, formatted_log_time);
-  appendStringInfoCharMacro(buf, ',');
+  (*write_to_log)(buf, "log time", formatted_log_time, true, true, false);
 
   /* username */
   if (MyProcPort && MyProcPort->user_name)
-    appendStringInfoString(buf, MyProcPort->user_name);
-  appendStringInfoCharMacro(buf, ',');
+    (*write_to_log)(buf, "user", MyProcPort->user_name, true, false, false);
+  else
+    (*write_to_log)(buf, "user", "", false, false, false);
 
   /* database name */
   if (MyProcPort && MyProcPort->database_name)
-    appendStringInfoString(buf, MyProcPort->database_name);
-  appendStringInfoCharMacro(buf, ',');
+    (*write_to_log)(buf, "database", MyProcPort->database_name, true, false, false);
+  else
+    (*write_to_log)(buf, "database", "", false, false, false);
 
   /* Process id  */
-  appendStringInfo(buf, "%d", log_my_pid);
-  appendStringInfoCharMacro(buf, ',');
+  initStringInfo(&data);
+  appendStringInfo(&data, "%d", log_my_pid);
+  (*write_to_log)(buf, "process ID", data.data, false, false, false);
 
   /* Remote host and port */
+  resetStringInfo(&data);
   if (MyProcPort && MyProcPort->remote_host)
   {
-    appendStringInfoString(buf, MyProcPort->remote_host);
+    appendStringInfoString(&data, MyProcPort->remote_host);
     if (MyProcPort->remote_port && MyProcPort->remote_port[0] != '\0')
     {
-      appendStringInfoCharMacro(buf, ':');
-      appendStringInfoString(buf, MyProcPort->remote_port);
+      appendStringInfoChar(&data, ':');
+      appendStringInfoString(&data, MyProcPort->remote_port);
     }
   }
-  appendStringInfoCharMacro(buf, ',');
+  (*write_to_log)(buf, "host", data.data, ((data.data)[0] != '\0'), false, false);
 
   /* session id - hex representation of start time . session process id */
-  appendStringInfo(buf, "%lx.%x", (long)MyStartTime, log_my_pid);
-  appendStringInfoCharMacro(buf, ',');
+  resetStringInfo(&data);
+  appendStringInfo(&data, "%lx.%x", (long)MyStartTime, log_my_pid);
+  (*write_to_log)(buf, "session id", data.data, true, false, false);
 
   /* Line number */
-  appendStringInfo(buf, "%ld", log_line_number);
-  appendStringInfoCharMacro(buf, ',');
+  resetStringInfo(&data);
+  appendStringInfo(&data, "%ld", log_line_number);
+  (*write_to_log)(buf, "line number", data.data, false, false, false);
 
   /* PS display */
+  resetStringInfo(&data);
   if (MyProcPort)
   {
-    StringInfoData msgbuf;
     const char *psdisp;
     int displen;
 
-    initStringInfo(&msgbuf);
-
     psdisp = get_ps_display(&displen);
-    appendBinaryStringInfo(&msgbuf, psdisp, displen);
-    appendStringInfoString(buf, msgbuf.data);
-
-    pfree(msgbuf.data);
+    appendBinaryStringInfo(&data, psdisp, displen);
   }
-  appendStringInfoCharMacro(buf, ',');
+  (*write_to_log)(buf, "ps display", data.data, ((data.data)[0] != '\0'), false, false);
 
   /* session start timestamp */
-  appendStringInfoString(buf, formatted_start_time);
-  appendStringInfoCharMacro(buf, ',');
+  (*write_to_log)(buf, "session start timestamp", formatted_start_time, true, false, false);
 
   /* Virtual transaction id */
   /* keep VXID format in sync with lockfuncs.c */
+  resetStringInfo(&data);
 #if (PG_VERSION_NUM >= 170000)
   if (MyProc != NULL && MyProc->vxid.procNumber != INVALID_PROC_NUMBER)
-    appendStringInfo(buf, "%d/%u", MyProc->vxid.procNumber, MyProc->vxid.lxid);
+    appendStringInfo(&data, "%d/%u", MyProc->vxid.procNumber, MyProc->vxid.lxid);
 #else
   if (MyProc != NULL && MyProc->backendId != InvalidBackendId)
-    appendStringInfo(buf, "%d/%u", MyProc->backendId, MyProc->lxid);
+    appendStringInfo(&data, "%d/%u", MyProc->backendId, MyProc->lxid);
 #endif
-  appendStringInfoCharMacro(buf, ',');
+  (*write_to_log)(buf, "vxid", data.data, true, false, false);
 
   /* Transaction id */
-  appendStringInfo(buf, "%u", GetTopTransactionIdIfAny());
-  appendStringInfoCharMacro(buf, ',');
+  resetStringInfo(&data);
+  appendStringInfo(&data, "%u", GetTopTransactionIdIfAny());
+  (*write_to_log)(buf, "xid", data.data, false, false, false);
 
   /* SQL state code */
-  appendStringInfoString(buf, unpack_sql_state(edata->sqlerrcode));
-  appendStringInfoCharMacro(buf, ',');
+  (*write_to_log)(buf, "sqlstate", unpack_sql_state(edata->sqlerrcode), true, false, false);
 
   /* errmessage - PGAUDIT formatted text, +7 exclude "AUDIT: " prefix */
-  appendStringInfoString(buf, edata->message + exclude_nchars);
-  appendStringInfoCharMacro(buf, ',');
+  if (guc_pgaudit_ltf_log_json)
+  {
+    /* parse the audit log line and write it as JSON */
+    struct audit_record rec;
+
+    pgauditlogtofile_parse_csv(&rec, edata->message + exclude_nchars);
+    (*write_to_log)(buf, "audit mode", rec.type, true, false, false);
+    (*write_to_log)(buf, "statement ID", rec.statement_id, false, false, false);
+    (*write_to_log)(buf, "substatement ID", rec.substatement_id, false, false, false);
+    (*write_to_log)(buf, "class", rec.class, true, false, false);
+    (*write_to_log)(buf, "command tag", rec.command_tag, true, false, false);
+    (*write_to_log)(buf, "object type", rec.object_type, true, false, false);
+    (*write_to_log)(buf, "object name", rec.object_name, true, false, false);
+    (*write_to_log)(buf, "statement", rec.statement, true, false, false);
+    (*write_to_log)(buf, "parameters", rec.parameters, true, false, false);
+    if (rec.rows != NULL)
+      (*write_to_log)(buf, "rows", rec.rows, false, false, false);
+  }
+  else
+    (*write_to_log)(buf, "audit message", edata->message + exclude_nchars, true, false, false);
 
   /* errdetail or errdetail_log */
   if (edata->detail_log)
-    appendStringInfoString(buf, edata->detail_log);
+    (*write_to_log)(buf, "detail", edata->detail_log, true, false, false);
   else if (edata->detail)
-    appendStringInfoString(buf, edata->detail);
-  appendStringInfoCharMacro(buf, ',');
+    (*write_to_log)(buf, "detail", edata->detail, true, false, false);
+  else
+    (*write_to_log)(buf, "detail", "", false, false, false);
 
   /* errhint */
   if (edata->hint)
-    appendStringInfoString(buf, edata->hint);
-  appendStringInfoCharMacro(buf, ',');
+    (*write_to_log)(buf, "hint", edata->detail, true, false, false);
+  else
+    (*write_to_log)(buf, "hint", "", false, false, false);
 
   /* internal query */
   if (edata->internalquery)
-    appendStringInfoString(buf, edata->internalquery);
-  appendStringInfoCharMacro(buf, ',');
+    (*write_to_log)(buf, "internal query", edata->internalquery, true, false, false);
+  else
+    (*write_to_log)(buf, "internal query", "", false, false, false);
 
   /* if printed internal query, print internal pos too */
+  resetStringInfo(&data);
   if (edata->internalpos > 0 && edata->internalquery != NULL)
-    appendStringInfo(buf, "%d", edata->internalpos);
-  appendStringInfoCharMacro(buf, ',');
+    appendStringInfo(&data, "%d", edata->internalpos);
+  (*write_to_log)(buf, "internal position", data.data, false, false, false);
 
   /* errcontext */
   if (edata->context)
-    appendStringInfoString(buf, edata->context);
-  appendStringInfoCharMacro(buf, ',');
+    (*write_to_log)(buf, "error context", edata->context, true, false, false);
+  else
+    (*write_to_log)(buf, "error context", "", false, false, false);
 
   /* user query --- only reported if not disabled by the caller */
   if (debug_query_string != NULL && !edata->hide_stmt)
-    print_stmt = true;
-  if (print_stmt)
-    appendStringInfoString(buf, debug_query_string);
-  appendStringInfoCharMacro(buf, ',');
-  if (print_stmt && edata->cursorpos > 0)
-    appendStringInfo(buf, "%d", edata->cursorpos);
-  appendStringInfoCharMacro(buf, ',');
+  {
+    resetStringInfo(&data);
+    (*write_to_log)(buf, "query", debug_query_string, true, false, false);
+    if (edata->cursorpos > 0)
+      appendStringInfo(&data, "%d", edata->cursorpos);
+    (*write_to_log)(buf, "cursor position", data.data, false, false, false);
+  }
+  else
+  {
+    (*write_to_log)(buf, "query", "", false, false, false);
+    (*write_to_log)(buf, "cursor position", "", false, false, false);
+  }
 
   /* file error location */
   if (Log_error_verbosity >= PGERROR_VERBOSE)
   {
-    StringInfoData msgbuf;
-
-    initStringInfo(&msgbuf);
-
+    resetStringInfo(&data);
     if (edata->funcname && edata->filename)
-      appendStringInfo(&msgbuf, "%s, %s:%d", edata->funcname, edata->filename,
+      appendStringInfo(&data, "%s, %s:%d", edata->funcname, edata->filename,
                        edata->lineno);
     else if (edata->filename)
-      appendStringInfo(&msgbuf, "%s:%d", edata->filename, edata->lineno);
-    appendStringInfoString(buf, msgbuf.data);
-    pfree(msgbuf.data);
+      appendStringInfo(&data, "%s:%d", edata->filename, edata->lineno);
+    (*write_to_log)(buf, "error location", data.data, true, false, false);
   }
-  appendStringInfoCharMacro(buf, ',');
+  else
+    (*write_to_log)(buf, "error location", "", false, false, false);
 
   /* application name */
   if (application_name)
-    appendStringInfoString(buf, application_name);
-
-  appendStringInfoCharMacro(buf, '\n');
+    (*write_to_log)(buf, "application name", application_name, true, false, true);
+  else
+    (*write_to_log)(buf, "application name", "", false, false, true);
 }
 
 /**

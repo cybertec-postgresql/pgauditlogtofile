@@ -91,6 +91,12 @@ void _PG_init(void)
       INT_MAX / MINS_PER_HOUR, PGC_SIGHUP,
       GUC_NOT_IN_SAMPLE | GUC_UNIT_MIN | GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
 
+  DefineCustomBoolVariable(
+      "pgaudit.log_json",
+      "Write the log file in JSON format", NULL,
+      &guc_pgaudit_ltf_log_json, false, PGC_SIGHUP,
+      GUC_NOT_IN_SAMPLE | GUC_SUPERUSER_ONLY, NULL, NULL, NULL);
+
   EmitWarningsOnPlaceholders("pgauditlogtofile");
 
   /* background worker */

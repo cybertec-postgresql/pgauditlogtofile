@@ -72,6 +72,13 @@ Intercepts server log messages emited when log_disconnections is on
 
 **Requires**: log_disconnections = on
 
+### pgaudit.log_json
+Writes the audit log in JSON format rather than CSV format
+
+**Scope**: System
+
+**Default**: off
+
 ### pgaudit.log_autoclose_minutes
 **EXPERIMENTAL**: automatically closes the audit log file handler kept by a backend after N minutes of inactivity.
 
